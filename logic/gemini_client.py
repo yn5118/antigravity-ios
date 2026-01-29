@@ -17,12 +17,24 @@ class GeminiClient:
     def __init__(self):
         # Force load env vars
         load_dotenv(override=True)
-        # Debug print
-        print(f"Loading Env... Key Found: {bool(os.getenv('GOOGLE_API_KEY'))}")
         
         api_key = os.getenv("GOOGLE_API_KEY")
+        
+        # Streamlit Cloud Specific Fallback
         if not api_key:
-            print("Warning: GOOGLE_API_KEY not found in environment variables.")
+            try:
+                import streamlit as st
+                if "GOOGLE_API_KEY" in st.secrets:
+                    api_key = st.secrets["GOOGLE_API_KEY"]
+                    print("Success: Found API Key in Streamlit Secrets")
+            except Exception as e:
+                print(f"Streamlit Secrets lookup failed: {e}")
+
+        # Final Check
+        print(f"Loading Env... Key Found: {bool(api_key)}")
+        
+        if not api_key:
+            print("Warning: GOOGLE_API_KEY not found in environment variables OR secrets.")
         
         self.flash_model = None
         self.pro_model = None
