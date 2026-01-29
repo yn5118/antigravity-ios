@@ -1,0 +1,13 @@
+streamlit
+yfinance
+pandas
+numpy
+openai
+plotly
+feedparser
+beautifulsoup4
+requests
+pandas-ta
+python-dotenv
+watchdog
+google-generativeai>=0.8.0
