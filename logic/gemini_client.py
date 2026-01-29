@@ -39,15 +39,27 @@ class GeminiClient:
         self.flash_model = None
         self.pro_model = None
         
-        try:
-            genai.configure(api_key=api_key, transport='rest')
-            self._auto_select_models()
+        if not api_key:
+            print("CRITICAL: GOOGLE_API_KEY NOT FOUND. AI features will fail.")
+            # Set a flag to handle this gracefully later
+            self.api_key_valid = False
+        else:
+            self.api_key_valid = True
 
-        except Exception as e:
-            print(f"Error configuring Gemini: {e}")
-            # Extreme fallback
-            self.flash_model = genai.GenerativeModel('gemini-pro')
-            self.pro_model = genai.GenerativeModel('gemini-pro')
+        self.flash_model = None
+        self.pro_model = None
+        
+        if self.api_key_valid:
+            try:
+                genai.configure(api_key=api_key, transport='rest')
+                self._auto_select_models()
+            except Exception as e:
+                print(f"Error configuring Gemini: {e}")
+                self.api_key_valid = False
+        
+        if not self.api_key_valid:
+            # Fallback to prevent crash, but operations will return error messages
+            print("Gemini Client initialized in OFFLINE mode.")
 
     def _auto_select_models(self):
         """Automatically select the best available models."""
@@ -142,6 +154,9 @@ class GeminiClient:
         if not active_model:
              # Last resort fallback if primary selection failed
              active_model = self.flash_model or self.pro_model
+
+        if not self.api_key_valid:
+            return {"score": 50, "reason": "ERROR: API Key not set in Streamlit Secrets.", "sentiment": "NEUTRAL"}
 
         if not active_model:
             return {"score": 50, "reason": "AI Models not initialized", "sentiment": "NEUTRAL"}
@@ -264,6 +279,10 @@ class GeminiClient:
         Uses Flash for speed.
         """
         model = self.flash_model or self.pro_model
+        
+        if not self.api_key_valid:
+            return [{"person": "Setup Error", "asset": "API", "impact": 0, "strategy": "Error", "reason": "API Keyが設定されていません。StreamlitのSecretsを設定してください。"}]
+
         if not model:
             return []
 
