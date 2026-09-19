@@ -34,3 +34,8 @@ wheels/
 
 # Project specific
 demo_data.json
+
+# copytrade (demo trading records)
+copytrade/trades.db
+copytrade/trades.db-*
+copytrade/*.log
