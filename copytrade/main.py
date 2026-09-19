@@ -122,12 +122,21 @@ async def stopper(stop: asyncio.Event, duration: float | None) -> None:
 
 
 def install_signal_handlers(stop: asyncio.Event) -> None:
+    """Ctrl+C / SIGTERM で安全に停止できるようにする。"""
     loop = asyncio.get_running_loop()
+
+    def request_stop(*_args: object) -> None:
+        loop.call_soon_threadsafe(stop.set)
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
-        except (NotImplementedError, RuntimeError):  # Windows 等
-            pass
+        except (NotImplementedError, RuntimeError, AttributeError, ValueError):
+            # Windows は add_signal_handler 非対応なので signal モジュールで代替する
+            try:
+                signal.signal(sig, request_stop)
+            except (OSError, ValueError, AttributeError):
+                log.debug("シグナル %s のハンドラを登録できませんでした", sig)
 
 
 # --------------------------------------------------------------------------

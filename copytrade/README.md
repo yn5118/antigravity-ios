@@ -71,6 +71,39 @@ python -m copytrade.main --reset                    # DB を初期化して開�
 python tests.py                                     # 自己テスト
 ```
 
+## Windows (コマンドプロンプト) での手順
+
+```bat
+cd /d C:\Users\<ユーザー名>
+mkdir dev & cd dev
+git clone https://github.com/yn5118/antigravity-ios.git
+cd antigravity-ios
+git checkout claude/solana-evm-wallet-demo-trading-t5jut0
+python -m pip install -r copytrade\requirements.txt
+
+python -m copytrade.main --simulate --duration 30 --reset
+```
+
+- コマンドはすべて `antigravity-ios` フォルダ（`copytrade` フォルダがある階層）で実行する。
+- 環境変数は `export` ではなく `set`（そのウィンドウのみ有効）。恒久設定は `setx` か
+  リポジトリ直下に `.env` を置く（`python-dotenv` が読み込む）。
+
+```bat
+set HELIUS_API_KEY=xxxxxxxx
+set ETHERSCAN_API_KEY=xxxxxxxx
+set WATCHED_WALLETS=solana:<addr>:whale1,ethereum:0x...:whale2
+```
+
+- `python` が見つからない場合は `py -3` を使う（`py -3 -m copytrade.main ...`）。
+- Ctrl+C で停止できる（Windows では `signal` モジュール経由でハンドラを登録している）。
+  停止時に成績が表示されるが、途中で強制終了しても約定は都度 `trades.db` に書かれているため
+  `--report` で後から確認できる。
+- `sqlite3` コマンドが無い場合は Python から参照する:
+
+```bat
+python -c "import sqlite3;c=sqlite3.connect(r'copytrade\trades.db');print(*c.execute('select wallet_label,token_symbol,round(realized_pnl,2) from trades where side=\'SELL\' and status=\'FILLED\' order by realized_pnl desc limit 10'),sep=chr(10))"
+```
+
 ## 主な設定（すべて環境変数で上書き可能）
 
 | 変数 | 既定値 | 意味 |
