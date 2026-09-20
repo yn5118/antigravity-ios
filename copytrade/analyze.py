@@ -271,6 +271,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n=== ウォレット別成績（{period} / 決済 {args.min_closes} 回以上 / {args.sort} 順）===")
     print_table(entries)
 
+    if not entries:
+        best = max((e.closes for e in stats.values()), default=0)
+        print("  （該当なし）")
+        print(
+            f"\n※ 決済回数が最も多いウォレットでも {best} 回のため、--min-closes {args.min_closes}"
+            " で全件が除外されました。"
+        )
+        print(f"　 今のデータを見るなら --min-closes {max(1, best)} まで下げてください。")
+        print("　 判断材料にするには、実データで数日〜数週間ぶんを貯めるのが先です。")
+
     total_realized = sum(e.realized_pnl for e in stats.values())
     total_unrealized = sum(e.unrealized for e in stats.values())
     print("-" * 110)
@@ -303,13 +313,15 @@ def main(argv: list[str] | None = None) -> int:
         for note, count in skip_reasons(conn, since_ms):
             print(f"  {count:>5} 件  {note}")
 
-    if args.top:
-        best = entries[: args.top]
-        print(f"\n=== 上位 {len(best)} 件（.env にそのまま貼れます）===")
-        spec = ",".join(f"{e.chain}:{e.wallet}:{e.label or 'top'}" for e in best)
+    if args.top and entries:
+        top = entries[: args.top]
+        print(f"\n=== 上位 {len(top)} 件（.env にそのまま貼れます）===")
+        spec = ",".join(f"{e.chain}:{e.wallet}:{e.label or 'top'}" for e in top)
         print(f"WATCHED_WALLETS={spec}")
         print("\n※ 決済回数が少ないウォレットは偶然勝っている可能性があります。")
         print("　 --min-closes で足切りし、数週間分のデータで判断してください。")
+    elif args.top:
+        print("\n※ 条件を満たすウォレットが無いため WATCHED_WALLETS は出力しません。")
 
     if args.csv:
         path = Path(args.csv)
