@@ -277,6 +277,93 @@ def is_stable(symbol: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# シグナル集約（オンチェーンの動き -> MT5 メジャー銘柄の方向性）
+# --------------------------------------------------------------------------
+#: MT5 側で扱うメジャー資産
+MAJOR_ASSETS = ("BTC", "ETH", "SOL")
+
+#: 直接マッピングできるトークン（シンボル or アドレス小文字 -> 資産）
+MAJOR_TOKEN_MAP: dict[str, str] = {
+    # Bitcoin 系
+    "WBTC": "BTC", "CBBTC": "BTC", "BTCB": "BTC", "TBTC": "BTC",
+    "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": "BTC",  # WBTC (Ethereum)
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": "BTC",  # WBTC (Solana / Wormhole)
+    # Ethereum 系
+    "WETH": "ETH", "STETH": "ETH", "WSTETH": "ETH", "CBETH": "ETH",
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "ETH",
+    "0x4200000000000000000000000000000000000006": "ETH",
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1": "ETH",
+    # Solana 系
+    "SOL": "SOL", "WSOL": "SOL", "MSOL": "SOL", "JITOSOL": "SOL",
+    WSOL_MINT: "SOL",
+    NATIVE_SOL: "SOL",
+}
+
+#: 「その他のトークンの売買」をリスクオン/オフの代理指標として結び付けるネイティブ資産
+CHAIN_PROXY_ASSET: dict[str, str | None] = {
+    SOLANA: "SOL",
+    "ethereum": "ETH",
+    "base": "ETH",
+    "arbitrum": "ETH",
+    "bsc": None,      # BNB は MT5 のメジャーではないので代理指標にしない
+    "polygon": None,
+}
+
+#: 集計のローリングウィンドウ（秒）
+SIGNAL_WINDOW_SEC = _env_float("SIGNAL_WINDOW_SEC", 900.0)
+#: LONG/SHORT を出すネット金額のしきい値（USD）
+SIGNAL_NET_USD_THRESHOLD = _env_float("SIGNAL_NET_USD_THRESHOLD", 50_000.0)
+#: しきい値到達に必要な異なるウォレット数
+SIGNAL_MIN_WALLETS = _env_int("SIGNAL_MIN_WALLETS", 2)
+#: 建玉を閉じるときのしきい値比率（ヒステリシス）
+SIGNAL_EXIT_RATIO = _env_float("SIGNAL_EXIT_RATIO", 0.4)
+#: メジャー以外のトークン売買をネイティブ資産のシグナルに換算する重み
+SIGNAL_PROXY_WEIGHT = _env_float("SIGNAL_PROXY_WEIGHT", 0.5)
+#: 同じ資産で連続シグナルを出すまでの最短間隔（秒）
+SIGNAL_COOLDOWN_SEC = _env_float("SIGNAL_COOLDOWN_SEC", 300.0)
+
+
+# --------------------------------------------------------------------------
+# MT5 連携（MetaTrader5 Python パッケージ）
+# --------------------------------------------------------------------------
+#: 実口座への発注を許可するか。既定は False（デモ口座以外では発注しない）
+MT5_ALLOW_LIVE = _env_bool("MT5_ALLOW_LIVE", False)
+MT5_LOGIN = _env_int("MT5_LOGIN", 0)
+MT5_PASSWORD = _env_str("MT5_PASSWORD")          # ログには絶対に出さない
+MT5_SERVER = _env_str("MT5_SERVER")
+MT5_TERMINAL_PATH = _env_str("MT5_TERMINAL_PATH")  # terminal64.exe のパス（任意）
+
+#: ブローカーごとに銘柄名が違うので候補を順に試す
+MT5_SYMBOL_CANDIDATES: dict[str, list[str]] = {
+    "BTC": ["BTCUSD", "BTCUSD.", "BTCUSDm", "BTCUSD.cash", "BTCUSD_", "Bitcoin"],
+    "ETH": ["ETHUSD", "ETHUSD.", "ETHUSDm", "ETHUSD.cash", "ETHUSD_", "Ethereum"],
+    "SOL": ["SOLUSD", "SOLUSD.", "SOLUSDm", "SOLUSD.cash"],
+}
+#: 環境変数で個別に上書き（例: MT5_SYMBOL_BTC=BTCUSD.pro）
+for _asset in MAJOR_ASSETS:
+    _override = _env_str(f"MT5_SYMBOL_{_asset}")
+    if _override:
+        MT5_SYMBOL_CANDIDATES[_asset] = [_override]
+
+#: ロット決定 "risk"（残高に対するリスク%から逆算）/ "fixed"（固定ロット）
+MT5_LOT_MODE = _env_str("MT5_LOT_MODE", "fixed").lower()
+MT5_FIXED_LOT = _env_float("MT5_FIXED_LOT", 0.01)
+MT5_RISK_PCT = _env_float("MT5_RISK_PCT", 0.5)
+#: 損切り / 利確（エントリー価格に対する%）。0 で無効
+MT5_SL_PCT = _env_float("MT5_SL_PCT", 1.5)
+MT5_TP_PCT = _env_float("MT5_TP_PCT", 3.0)
+#: 同時に持つポジション数と 1 銘柄あたりの上限ロット
+MT5_MAX_POSITIONS = _env_int("MT5_MAX_POSITIONS", 3)
+MT5_MAX_LOT = _env_float("MT5_MAX_LOT", 1.0)
+#: 反対シグナルが出たら決済してドテンするか
+MT5_CLOSE_ON_OPPOSITE = _env_bool("MT5_CLOSE_ON_OPPOSITE", True)
+MT5_MAGIC = _env_int("MT5_MAGIC", 20260920)
+MT5_DEVIATION = _env_int("MT5_DEVIATION", 20)
+#: dry-run 時に使う参考価格（実際の MT5 に接続しない検証用）
+MT5_DRYRUN_PRICES = {"BTC": 60_000.0, "ETH": 3_000.0, "SOL": 150.0}
+
+
+# --------------------------------------------------------------------------
 # 保存先 / ログ
 # --------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent

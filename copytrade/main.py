@@ -27,11 +27,15 @@ try:  # `python -m copytrade.main` / `python main.py` の両対応
     from . import config
     from . import monitor as monitor_mod
     from .demo_trader import DemoTrader
+    from .mt5_trader import DryRunBroker, Mt5Broker, Mt5Trader
+    from .signals import SignalEngine
 except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import config
     import monitor as monitor_mod
     from demo_trader import DemoTrader
+    from mt5_trader import DryRunBroker, Mt5Broker, Mt5Trader
+    from signals import SignalEngine
 
 log = logging.getLogger("copytrade")
 
@@ -71,8 +75,10 @@ async def trade_worker(
     queue: "asyncio.Queue[monitor_mod.SwapEvent]",
     trader: DemoTrader,
     stop: asyncio.Event,
+    signal_engine: SignalEngine | None = None,
+    mt5: Mt5Trader | None = None,
 ) -> None:
-    """キューからイベントを取り出してデモ約定させる。"""
+    """キューからイベントを取り出してデモ約定 / シグナル集約を行う。"""
     while True:
         try:
             event = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -84,11 +90,24 @@ async def trade_worker(
             await trader.handle_event(event)
         except Exception:  # noqa: BLE001 - 1 件の失敗で停止させない
             log.exception("約定処理に失敗: %s", event.describe())
-        finally:
-            queue.task_done()
+
+        if signal_engine is not None:
+            try:
+                signal = signal_engine.add(event)
+                if signal is not None and mt5 is not None:
+                    await mt5.on_signal(signal)
+            except Exception:  # noqa: BLE001 - シグナル側の失敗も監視を止めない
+                log.exception("シグナル処理に失敗: %s", event.describe())
+
+        queue.task_done()
 
 
-async def mark_worker(trader: DemoTrader, stop: asyncio.Event, interval: float) -> None:
+async def mark_worker(
+    trader: DemoTrader,
+    stop: asyncio.Event,
+    interval: float,
+    signal_engine: SignalEngine | None = None,
+) -> None:
     """定期的に建玉を時価評価してエクイティを記録する。"""
     while not stop.is_set():
         with contextlib.suppress(asyncio.TimeoutError):
@@ -107,6 +126,8 @@ async def mark_worker(trader: DemoTrader, stop: asyncio.Event, interval: float) 
                 snapshot["realized_pnl"],
                 snapshot["unrealized_pnl"],
             )
+            if signal_engine is not None:
+                log.info("シグナル状況 | %s", signal_engine.describe_state())
         except Exception:  # noqa: BLE001
             log.exception("時価評価に失敗")
 
@@ -176,6 +197,27 @@ async def run(args: argparse.Namespace) -> int:
         await trader.close()
         return 3
 
+    signal_engine: SignalEngine | None = None
+    mt5: Mt5Trader | None = None
+    if args.mt5 or args.mt5_dry_run:
+        signal_engine = SignalEngine()
+        broker = DryRunBroker() if args.mt5_dry_run else Mt5Broker()
+        mt5 = Mt5Trader(broker)
+        try:
+            await mt5.start()
+        except Exception as exc:  # noqa: BLE001 - 接続失敗は分かりやすく伝える
+            log.error("MT5 の初期化に失敗しました: %s", exc)
+            await session.close()
+            await trader.close()
+            return 4
+        log.info(
+            "シグナル設定 | ウィンドウ %.0fs / しきい値 %s USD / 最小 %d ウォレット / 代理重み %.2f",
+            config.SIGNAL_WINDOW_SEC,
+            f"{config.SIGNAL_NET_USD_THRESHOLD:,.0f}",
+            config.SIGNAL_MIN_WALLETS,
+            config.SIGNAL_PROXY_WEIGHT,
+        )
+
     queue: "asyncio.Queue[monitor_mod.SwapEvent]" = asyncio.Queue(maxsize=1000)
     stop = asyncio.Event()
     install_signal_handlers(stop)
@@ -188,9 +230,13 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     tasks = [asyncio.create_task(m.run(queue, stop), name=f"monitor:{m.wallet.name}") for m in monitors]
-    tasks.append(asyncio.create_task(trade_worker(queue, trader, stop), name="trader"))
     tasks.append(
-        asyncio.create_task(mark_worker(trader, stop, config.MARK_INTERVAL_SEC), name="mark")
+        asyncio.create_task(trade_worker(queue, trader, stop, signal_engine, mt5), name="trader")
+    )
+    tasks.append(
+        asyncio.create_task(
+            mark_worker(trader, stop, config.MARK_INTERVAL_SEC, signal_engine), name="mark"
+        )
     )
     tasks.append(asyncio.create_task(stopper(stop, args.duration), name="stopper"))
 
@@ -217,6 +263,10 @@ async def run(args: argparse.Namespace) -> int:
             )
         log.info("価格 API: %d リクエスト / %d 失敗", price_feed.requests, price_feed.failures)
         print(await trader.report())
+        if mt5 is not None:
+            log.info("シグナル状況 | %s", signal_engine.describe_state() if signal_engine else "-")
+            print(await mt5.report())
+            await mt5.close()
         await session.close()
         await trader.close()
     return 0
@@ -231,6 +281,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--check-config", action="store_true", help="設定を検証して終了")
     parser.add_argument("--no-live-price", action="store_true", help="DEXScreener を使わずイベント価格で約定")
     parser.add_argument("--max-wallets", type=int, default=None, help="先頭 N 件だけ監視")
+    parser.add_argument("--mt5", action="store_true", help="シグナルを MT5 に発注する（要 MetaTrader5）")
+    parser.add_argument(
+        "--mt5-dry-run", action="store_true", help="MT5 に接続せずシグナルと執行判断だけ検証する"
+    )
     parser.add_argument("--log-level", default=config.LOG_LEVEL, help="DEBUG / INFO / WARNING")
     return parser.parse_args(argv)
 

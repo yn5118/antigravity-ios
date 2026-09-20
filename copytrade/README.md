@@ -8,21 +8,26 @@
 
 ```
 copytrade/
-├── config.py        監視アドレス・APIキー・デモ初期資金・サイズ設定の一元管理
+├── config.py        監視アドレス・APIキー・デモ初期資金・サイズ/シグナル/MT5 設定
 ├── monitor.py       Helius / Solana RPC / Etherscan V2 でスワップ検知、DEXScreener 価格取得
 ├── demo_trader.py   仮想注文の執行、建玉管理、PnL 計算、trades.db への保存
+├── signals.py       オンチェーンの売買を BTC/ETH/SOL の方向性シグナルに集約
+├── mt5_trader.py    シグナルを MT5（MetaTrader5 パッケージ）で執行。dry-run 対応
+├── analyze.py       trades.db から「勝っているウォレット」を抽出する分析 CLI
 ├── main.py          asyncio による 10 アドレス並列監視のメインループ
-├── tests.py         外部 API を使わない自己テスト（12 件）
+├── tests.py         外部 API / MT5 を使わない自己テスト（23 件）
 └── requirements.txt
 ```
 
 データフロー:
 
 ```
- 監視タスク×N (アドレスごと)  --SwapEvent-->  asyncio.Queue  -->  DemoTrader (1タスク)
-        ポーリング + 重複排除                                  └-> 定期の時価評価タスク
-                                                                    -> trades.db
+ 監視タスク×N (アドレスごと)  --SwapEvent-->  asyncio.Queue  --> DemoTrader     -> trades.db
+        ポーリング + 重複排除                                  └-> SignalEngine -- MajorSignal -->
+                                                                   Mt5Trader (--mt5 / --mt5-dry-run)
 ```
+
+MT5 連携は任意。`--mt5` / `--mt5-dry-run` を付けなければ従来どおりデモ記録のみで動く。
 
 ## 必要なライブラリ
 
@@ -122,6 +127,95 @@ python -c "import sqlite3;c=sqlite3.connect(r'copytrade\trades.db');print(*c.exe
 | `MAX_EVENT_AGE_SEC` | 600 | これより古いイベントは約定させない |
 | `LOG_LEVEL` / `COPYTRADE_DB_PATH` | INFO / `copytrade/trades.db` | ログレベル / DB パス |
 
+## MT5 へ繋ぐまでの流れ
+
+MT5 のメジャー銘柄（BTCUSD / ETHUSD / SOLUSD）で自動売買することを想定した段階的な手順。
+
+**フェーズ1: データを貯める**
+
+```bash
+python -m copytrade.main            # 数日〜数週間動かす
+```
+
+**フェーズ2: 勝っているウォレットを絞る**
+
+```bash
+python -m copytrade.analyze --days 14 --min-closes 10 --tokens --skips
+python -m copytrade.analyze --top 3 --min-closes 10   # .env に貼れる形式で出力
+```
+
+決済回数が少ないウォレットは偶然勝っているだけの可能性が高いので、`--min-closes` で
+足切りしてから判断する。
+
+**フェーズ3: シグナル化の確認（MT5 に繋がない）**
+
+```bash
+python -m copytrade.main --mt5-dry-run --duration 3600
+```
+
+`SignalEngine` がどのタイミングで LONG / SHORT を出すかをログで確認し、
+`SIGNAL_NET_USD_THRESHOLD` などを調整する。
+
+**フェーズ4: MT5 デモ口座で執行**
+
+```bash
+pip install MetaTrader5          # Windows のみ
+python -m copytrade.main --mt5
+```
+
+MT5 ターミナルを起動してデモ口座にログインし、「アルゴリズム取引」を有効にしておく。
+実口座に接続していると `MT5_ALLOW_LIVE=1` を明示しない限り起動時に停止する。
+
+**フェーズ5: 小ロットで実弾** — フェーズ4の成績を確認してから。
+
+## シグナルの作り方
+
+個々のスワップを「投票」として扱い、ローリングウィンドウ内のネット金額で方向を決める。
+
+| 種別 | 対象 | 重み |
+|---|---|---|
+| 直接 (direct) | WBTC / WETH / SOL など、メジャー資産そのものの売買 | 1.0 |
+| 代理 (proxy) | それ以外のトークンの売買を、そのチェーンのネイティブ資産への強気/弱気とみなす | `SIGNAL_PROXY_WEIGHT`（既定 0.5）|
+
+- ネット金額が `SIGNAL_NET_USD_THRESHOLD` を超え、かつ同じ方向に寄与したウォレットが
+  `SIGNAL_MIN_WALLETS` 以上のときだけ LONG / SHORT を出す（1 件の大口では発火しない）。
+- ネットがしきい値の `SIGNAL_EXIT_RATIO` 倍を下回ると FLAT（手仕舞い）。
+- 同じ資産で連続エントリーしないよう `SIGNAL_COOLDOWN_SEC` のクールダウンを持つ。
+- BNB / POL は MT5 のメジャーではないため代理シグナルの対象外（`CHAIN_PROXY_ASSET`）。
+
+**代理シグナルは解釈であって資金フローそのものではない。** SOL でミームコインを買う行為は
+厳密には SOL を手放しているが、ここでは「そのチェーンに強気」と解釈している。
+この解釈を使いたくない場合は `SIGNAL_PROXY_WEIGHT=0` にすれば直接マッピングだけになる。
+
+## MT5 の主な設定
+
+| 変数 | 既定値 | 意味 |
+|---|---|---|
+| `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` | 空 | 省略時は起動中のターミナルのログイン状態を使う |
+| `MT5_TERMINAL_PATH` | 空 | `terminal64.exe` のパス（複数インストール時） |
+| `MT5_SYMBOL_BTC` / `_ETH` / `_SOL` | 自動 | ブローカー固有の銘柄名で上書き（例: `BTCUSD.pro`）|
+| `MT5_LOT_MODE` | `fixed` | `fixed`=固定ロット / `risk`=残高に対するリスク%から逆算 |
+| `MT5_FIXED_LOT` / `MT5_RISK_PCT` | 0.01 / 0.5 | ロット決定パラメータ |
+| `MT5_SL_PCT` / `MT5_TP_PCT` | 1.5 / 3.0 | 損切り / 利確（価格に対する%、0 で無効）|
+| `MT5_MAX_POSITIONS` / `MT5_MAX_LOT` | 3 / 1.0 | 同時建玉数 / 1 回あたりの上限ロット |
+| `MT5_CLOSE_ON_OPPOSITE` | true | 反対シグナルでドテンする |
+| `MT5_MAGIC` | 20260920 | このプログラムの建玉を識別する番号。他の建玉には触らない |
+| `MT5_ALLOW_LIVE` | false | true にしない限り実口座では発注しない |
+
+発注結果は `trades.db` の `mt5_orders` テーブルに記録される（OPEN / CLOSE / SKIP / ERROR）。
+
+## 分析 CLI (`analyze.py`)
+
+```bash
+python -m copytrade.analyze                      # ウォレット別成績
+python -m copytrade.analyze --sort roi           # 並び替え: realized / total / roi / winrate
+python -m copytrade.analyze --days 7 --tokens    # 期間指定 + 銘柄別
+python -m copytrade.analyze --skips              # 見送り理由の内訳（設定が厳しすぎないか）
+python -m copytrade.analyze --csv report.csv     # CSV 出力
+```
+
+表示項目: 約定数 / 決済数 / 勝率 / 実現損益 / 含み損益 / ROI / 平均保有時間 / 平均タイムラグ。
+
 ## 記録される内容（`trades.db`）
 
 - `trades` — 約定・見送りの全履歴。`detect_lag_ms`（ブロック確定→検知）、
@@ -162,4 +256,12 @@ python -c "import sqlite3;c=sqlite3.connect(r'copytrade\trades.db');print(*c.exe
   `BaseWalletMonitor.run()` を置き換える（他のレイヤは変更不要）。
 - 無料枠のレート制限に注意。10 アドレス × 5 秒間隔で 1 分あたり約 120 リクエストになる。
 - 建玉は「ウォレット×銘柄」単位で管理するため、複数ウォレットが同じ銘柄を買うと建玉も複数になる。
-- デモ（ペーパートレード）専用。秘密鍵を扱わず、実際の発注機能は持たない。
+- オンチェーン側はデモ（ペーパートレード）専用。秘密鍵を扱わず、DEX への実発注機能は持たない。
+- **MT5 とオンチェーンの銘柄は一致しない。** MT5 には BONK / WIF / PEPE のような
+  トークンは存在せず、扱えるのは BTCUSD / ETHUSD / SOLUSD などのメジャー CFD だけ。
+  そのためオンチェーンの動きは「メジャー銘柄の方向性を示す指標」としてのみ使う。
+- `mt5_trader.py` は MetaTrader5 パッケージ（Windows 専用）が必要。この検証環境では
+  実 MT5 への接続は確認できていないため、ロジックは `DryRunBroker` で検証している。
+  Windows では必ず `--mt5-dry-run` → MT5 デモ口座 → 小ロット実弾の順で確認すること。
+- MT5 は週末クローズ・スプレッド・スワップ・最小ロットがあり、24/365 の DEX とは
+  執行条件が異なる。同じシグナルでも成績は一致しない。

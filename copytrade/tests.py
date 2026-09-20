@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -17,12 +18,16 @@ try:  # パッケージ / 単体の両対応
     from . import monitor as monitor_mod
     from .demo_trader import DemoTrader
     from .monitor import BUY, SELL, PriceFeed, SwapEvent, classify_swap, now_ms
+    from .mt5_trader import DryRunBroker, Mt5Trader
+    from .signals import FLAT, LONG, SHORT, SignalEngine
 except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import config
     import monitor as monitor_mod
     from demo_trader import DemoTrader
     from monitor import BUY, SELL, PriceFeed, SwapEvent, classify_swap, now_ms
+    from mt5_trader import DryRunBroker, Mt5Trader
+    from signals import FLAT, LONG, SHORT, SignalEngine
 
 WALLET_SOL = "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9"
 WALLET_EVM = "0x28c6c06298d514db089934071355e5743bf21d60"
@@ -330,6 +335,268 @@ class DemoTraderTest(unittest.TestCase):
             self.assertAlmostEqual(reopened.cash_usd, cash)
             self.assertIn((config.SOLANA, WALLET_SOL, TOKEN_SOL), reopened.positions)
             await reopened.close()
+
+        asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------
+# シグナル集約
+# --------------------------------------------------------------------------
+def signal_event(
+    wallet: str,
+    side: str,
+    usd: float,
+    token: str = TOKEN_SOL,
+    symbol: str = "WEN",
+    chain: str = config.SOLANA,
+    ts_ms: int | None = None,
+    price: float = 1.0,
+) -> SwapEvent:
+    ts = ts_ms if ts_ms is not None else now_ms()
+    return SwapEvent(
+        chain=chain,
+        wallet=wallet,
+        wallet_label=wallet,
+        tx_hash=f"tx-{wallet}-{ts}-{usd}",
+        side=side,
+        token_address=token,
+        token_symbol=symbol,
+        token_amount=usd / price,
+        usd_amount=usd,
+        price_usd=price,
+        block_time_ms=ts - 500,
+        detected_at_ms=ts,
+        source="test",
+    )
+
+
+class SignalEngineTest(unittest.TestCase):
+    def engine(self, **kwargs) -> SignalEngine:
+        params = dict(
+            window_sec=600, threshold_usd=10_000, min_wallets=2,
+            exit_ratio=0.4, proxy_weight=0.5, cooldown_sec=0,
+        )
+        params.update(kwargs)
+        return SignalEngine(**params)
+
+    def test_asset_mapping(self) -> None:
+        engine = self.engine()
+        self.assertEqual(engine.asset_for_token(config.SOLANA, config.WSOL_MINT, "SOL"), ("SOL", "direct"))
+        self.assertEqual(
+            engine.asset_for_token("ethereum", "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", "WBTC"),
+            ("BTC", "direct"),
+        )
+        # メジャー以外はチェーンのネイティブ資産への代理シグナル
+        self.assertEqual(engine.asset_for_token(config.SOLANA, TOKEN_SOL, "WEN"), ("SOL", "proxy"))
+        # BNB / MATIC は MT5 のメジャーではないので対象外
+        self.assertEqual(engine.asset_for_token("bsc", "0xabc", "CAKE"), (None, ""))
+
+    def test_single_wallet_never_triggers(self) -> None:
+        engine = self.engine()
+        for _ in range(5):
+            self.assertIsNone(engine.add(signal_event("w1", BUY, 8_000, token=config.WSOL_MINT, symbol="SOL")))
+        self.assertEqual(engine.state("SOL"), FLAT)
+
+    def test_long_then_flat_on_decay(self) -> None:
+        engine = self.engine()
+        self.assertIsNone(engine.add(signal_event("w1", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL")))
+        signal = engine.add(signal_event("w2", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL"))
+        assert signal is not None
+        self.assertEqual((signal.asset, signal.direction, signal.wallets), ("SOL", LONG, 2))
+        self.assertAlmostEqual(signal.score_usd, 12_000.0)
+
+        # 反対売買でネットが縮むと手仕舞い
+        exit_signal = engine.add(signal_event("w3", SELL, 9_000, token=config.WSOL_MINT, symbol="SOL"))
+        assert exit_signal is not None
+        self.assertEqual(exit_signal.direction, FLAT)
+        self.assertEqual(engine.state("SOL"), FLAT)
+
+    def test_reverse_to_short(self) -> None:
+        engine = self.engine()
+        engine.add(signal_event("w1", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL"))
+        engine.add(signal_event("w2", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL"))
+        engine.add(signal_event("w1", SELL, 14_000, token=config.WSOL_MINT, symbol="SOL"))
+        signal = engine.add(signal_event("w2", SELL, 14_000, token=config.WSOL_MINT, symbol="SOL"))
+        assert signal is not None
+        self.assertEqual(signal.direction, SHORT)
+
+    def test_window_expiry(self) -> None:
+        engine = self.engine(window_sec=60)
+        old = now_ms() - 120_000
+        engine.add(signal_event("w1", BUY, 9_000, token=config.WSOL_MINT, symbol="SOL", ts_ms=old))
+        # 古い投票はウィンドウ外なので、新しい 9,000 USD だけではしきい値に届かない
+        self.assertIsNone(engine.add(signal_event("w2", BUY, 9_000, token=config.WSOL_MINT, symbol="SOL")))
+        self.assertEqual(engine.state("SOL"), FLAT)
+
+    def test_proxy_weight_halves_contribution(self) -> None:
+        engine = self.engine(proxy_weight=0.5)
+        engine.add(signal_event("w1", BUY, 12_000))  # メジャー以外 -> 6,000 相当
+        self.assertIsNone(engine.add(signal_event("w2", BUY, 6_000)))  # 合計 9,000 < 10,000
+        signal = engine.add(signal_event("w3", BUY, 6_000))  # 合計 12,000
+        assert signal is not None
+        self.assertEqual(signal.direction, LONG)
+        self.assertAlmostEqual(signal.score_usd, 12_000.0)
+
+    def test_cooldown_blocks_reentry(self) -> None:
+        engine = self.engine(cooldown_sec=600)
+        engine.add(signal_event("w1", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL"))
+        entry = engine.add(signal_event("w2", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL"))
+        assert entry is not None and entry.direction == LONG
+        exit_signal = engine.add(signal_event("w3", SELL, 9_000, token=config.WSOL_MINT, symbol="SOL"))
+        assert exit_signal is not None and exit_signal.direction == FLAT
+        # クールダウン中は再エントリーしない
+        engine.add(signal_event("w1", BUY, 9_000, token=config.WSOL_MINT, symbol="SOL"))
+        self.assertIsNone(engine.add(signal_event("w2", BUY, 9_000, token=config.WSOL_MINT, symbol="SOL")))
+        self.assertEqual(engine.state("SOL"), FLAT)
+
+
+# --------------------------------------------------------------------------
+# MT5 執行（dry-run ブローカー）
+# --------------------------------------------------------------------------
+class Mt5TraderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "trades.db"
+        self._saved = {k: getattr(config, k) for k in
+                       ("MT5_LOT_MODE", "MT5_FIXED_LOT", "MT5_RISK_PCT", "MT5_SL_PCT",
+                        "MT5_TP_PCT", "MT5_MAX_POSITIONS", "MT5_CLOSE_ON_OPPOSITE", "MT5_MAX_LOT")}
+        config.MT5_LOT_MODE = "fixed"
+        config.MT5_FIXED_LOT = 0.05
+        config.MT5_SL_PCT = 2.0
+        config.MT5_TP_PCT = 4.0
+        config.MT5_MAX_POSITIONS = 3
+        config.MT5_MAX_LOT = 1.0
+        config.MT5_CLOSE_ON_OPPOSITE = True
+
+    def tearDown(self) -> None:
+        for key, value in self._saved.items():
+            setattr(config, key, value)
+        self._tmp.cleanup()
+
+    def _trader(self) -> tuple[Mt5Trader, DryRunBroker]:
+        broker = DryRunBroker(balance=10_000.0, prices={"SOL": 150.0})
+        return Mt5Trader(broker, db_path=self.db), broker
+
+    def test_open_reverse_and_flat(self) -> None:
+        async def scenario() -> None:
+            trader, broker = self._trader()
+            await trader.start()
+            spec = trader.symbols["SOL"]
+            self.assertTrue(spec.name.startswith("SOLUSD"))
+
+            engine = SignalEngine(window_sec=600, threshold_usd=10_000, min_wallets=2, cooldown_sec=0)
+            engine.add(signal_event("w1", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL", price=150.0))
+            long_signal = engine.add(
+                signal_event("w2", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL", price=150.0)
+            )
+            assert long_signal is not None
+            await trader.on_signal(long_signal)
+            positions = broker.positions(spec)
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].direction, LONG)
+            self.assertAlmostEqual(positions[0].volume, 0.05)
+            self.assertLess(positions[0].sl, positions[0].price_open)
+            self.assertGreater(positions[0].tp, positions[0].price_open)
+
+            # 同方向シグナルは重複エントリーしない
+            await trader.on_signal(long_signal)
+            self.assertEqual(len(broker.positions(spec)), 1)
+            self.assertEqual(trader.skipped, 1)
+
+            # 反対シグナルでドテン
+            engine.add(signal_event("w1", SELL, 14_000, token=config.WSOL_MINT, symbol="SOL", price=150.0))
+            short_signal = engine.add(
+                signal_event("w2", SELL, 14_000, token=config.WSOL_MINT, symbol="SOL", price=150.0)
+            )
+            assert short_signal is not None and short_signal.direction == SHORT
+            await trader.on_signal(short_signal)
+            positions = broker.positions(spec)
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].direction, SHORT)
+
+            # FLAT で手仕舞い
+            flat = engine.add(signal_event("w3", BUY, 20_000, token=config.WSOL_MINT, symbol="SOL", price=150.0))
+            assert flat is not None and flat.direction == FLAT
+            await trader.on_signal(flat)
+            self.assertEqual(broker.positions(spec), [])
+
+            rows = sqlite3.connect(self.db).execute(
+                "SELECT action, direction FROM mt5_orders ORDER BY id"
+            ).fetchall()
+            actions = [r[0] for r in rows]
+            self.assertEqual(actions.count("OPEN"), 2)
+            self.assertEqual(actions.count("CLOSE"), 2)
+            self.assertIn("SKIP", actions)
+            await trader.close()
+
+        asyncio.run(scenario())
+
+    def test_volume_from_risk(self) -> None:
+        async def scenario() -> None:
+            config.MT5_LOT_MODE = "risk"
+            config.MT5_RISK_PCT = 1.0     # 10,000 USD の 1% = 100 USD
+            config.MT5_SL_PCT = 2.0       # 150 USD の 2% = 3.0 USD の値幅
+            trader, _ = self._trader()
+            await trader.start()
+            spec = trader.symbols["SOL"]
+            # 3.0 / 0.01 * 1.0 = 300 USD/ロット -> 100/300 = 0.333 -> ステップ 0.01 で切り捨て
+            self.assertAlmostEqual(trader.volume_for(spec, 150.0), 0.33)
+            # 上限でクランプされる
+            config.MT5_MAX_LOT = 0.10
+            self.assertAlmostEqual(trader.volume_for(spec, 150.0), 0.10)
+            await trader.close()
+
+        asyncio.run(scenario())
+
+    def test_max_positions_guard(self) -> None:
+        async def scenario() -> None:
+            config.MT5_MAX_POSITIONS = 1
+            trader, broker = self._trader()
+            await trader.start()
+
+            engine = SignalEngine(window_sec=600, threshold_usd=10_000, min_wallets=2, cooldown_sec=0)
+            engine.add(signal_event("w1", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL", price=150.0))
+            sol_signal = engine.add(
+                signal_event("w2", BUY, 6_000, token=config.WSOL_MINT, symbol="SOL", price=150.0)
+            )
+            assert sol_signal is not None
+            await trader.on_signal(sol_signal)
+
+            engine.add(signal_event("w1", BUY, 6_000, token="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                                    symbol="WETH", chain="ethereum", price=3_000.0))
+            eth_signal = engine.add(
+                signal_event("w2", BUY, 6_000, token="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                             symbol="WETH", chain="ethereum", price=3_000.0)
+            )
+            assert eth_signal is not None and eth_signal.asset == "ETH"
+            await trader.on_signal(eth_signal)
+
+            self.assertEqual(len(broker.positions(trader.symbols["ETH"])), 0)
+            self.assertGreaterEqual(trader.skipped, 1)
+            await trader.close()
+
+        asyncio.run(scenario())
+
+    def test_live_account_is_refused(self) -> None:
+        async def scenario() -> None:
+            broker = DryRunBroker()
+            original = broker.connect
+
+            def live_connect():
+                account = original()
+                account.is_demo = False
+                return account
+
+            broker.connect = live_connect  # type: ignore[method-assign]
+            trader = Mt5Trader(broker, db_path=self.db)
+            saved = config.MT5_ALLOW_LIVE
+            config.MT5_ALLOW_LIVE = False
+            try:
+                with self.assertRaises(RuntimeError):
+                    await trader.start()
+            finally:
+                config.MT5_ALLOW_LIVE = saved
+                await trader.close()
 
         asyncio.run(scenario())
 
